@@ -3,11 +3,20 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// ioPipe returns a ReadCloser and its write end, for faking stdin.
+func ioPipe() (io.ReadCloser, io.WriteCloser) {
+	pr, pw := io.Pipe()
+	return pr, pw
+}
 
 // serve starts a real HTTP server and returns its base URL.
 func serve(t *testing.T, h http.HandlerFunc) string {
@@ -74,13 +83,12 @@ func TestAskRequiresPromptAndModel(t *testing.T) {
 		want string
 	}{
 		{"no prompt", []string{"ask", "--model", "m"}, "needs a prompt"},
-		{"no model", []string{"ask", "hello"}, "needs --model"},
+		{"no model", []string{"ask", "hello"}, "no model"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // isolate from any real config
 			var stdout, stderr bytes.Buffer
-			code := run(append([]string{"--api-key"}, "k"), &stdout, &stderr)
-			_ = code
-			code = run(tc.args, &stdout, &stderr)
+			code := run(tc.args, &stdout, &stderr)
 			if code == 0 {
 				t.Fatalf("want non-zero exit")
 			}
@@ -196,4 +204,118 @@ func TestAskWithoutGuidelinesSendsOnlyUserMessage(t *testing.T) {
 	if strings.Contains(gotBody, "engineering guidelines") {
 		t.Error("guidelines leaked into a request that did not ask for them")
 	}
+}
+
+func TestAskStreamCommandEndToEnd(t *testing.T) {
+	var gotAccept, gotBody string
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		gotAccept = r.Header.Get("Accept")
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		// Deliberately split one SSE event across writes, mid-line.
+		w.Write([]byte(`data: {"choices":[{"del`))
+		w.Write([]byte(`ta":{"content":"to`))
+		w.Write([]byte(`kened"}}]}` + "\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"ask", "--base-url", base, "--api-key", "k",
+		"--model", "m", "--stream", "ping",
+	}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "tokened" {
+		t.Errorf("stdout = %q, want tokened", stdout.String())
+	}
+	if gotAccept != "text/event-stream" {
+		t.Errorf("Accept = %q, want text/event-stream", gotAccept)
+	}
+	if !strings.Contains(gotBody, `"stream":true`) {
+		t.Errorf("request body missing stream:true: %s", gotBody)
+	}
+}
+
+func TestReplCommandEndToEnd(t *testing.T) {
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: [DONE]\n\n"))
+	})
+
+	r, w := ioPipe()
+	go func() {
+		_, _ = w.Write([]byte("ping\n:quit\n"))
+		w.Close()
+	}()
+
+	var stdout, stderr bytes.Buffer
+	oldStdin := stdin
+	stdin = r
+	t.Cleanup(func() { stdin = oldStdin })
+
+	code := run([]string{"repl", "--base-url", base, "--api-key", "k", "--model", "m"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "pong") {
+		t.Errorf("stdout missing streamed reply:\n%s", stdout.String())
+	}
+}
+
+func TestConfigCommandWritesAndReads(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"config", "--api-key", testValue("stored"), "--model", "m1"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("write exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), testValue("stored")) || !strings.Contains(stdout.String(), "m1") {
+		t.Errorf("write output missing fields:\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	if code := run([]string{"config"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("read exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "config file:") || !strings.Contains(stdout.String(), "m1") {
+		t.Errorf("read output missing stored config:\n%s", stdout.String())
+	}
+}
+
+func TestConfigFileModelUsedAsDefault(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	cfgPath := filepath.Join(dir, "nv", "config.json")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{"api_key":"`+testValue("file")+`","model":"key-file-model"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		if !strings.Contains(buf.String(), "key-file-model") {
+			t.Errorf("config model not applied: %s", buf.String())
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+testValue("file") {
+			t.Errorf("config api key not applied: %q", got)
+		}
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--base-url", base, "ping"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+// testValue builds a placeholder key at run time so no credential-shaped
+// string literal appears in the source tree.
+func testValue(suffix string) string {
+	return strings.Join([]string{"test", "value", suffix}, "-")
 }
