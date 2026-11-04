@@ -15,6 +15,8 @@ type Message struct {
 type ChatRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
+	// Stream is set internally by ChatStream; omitted unless true.
+	Stream bool `json:"stream,omitempty"`
 }
 
 // Model is one entry from GET /models.
