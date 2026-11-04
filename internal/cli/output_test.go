@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ali-ulu/nv/internal/nim"
+	"github.com/ali-ulu/nvidia-cli/internal/nim"
 )
 
 var sample = []nim.Model{

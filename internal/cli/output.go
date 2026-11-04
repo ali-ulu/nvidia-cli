@@ -6,7 +6,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/ali-ulu/nv/internal/nim"
+	"github.com/ali-ulu/nvidia-cli/internal/nim"
 )
 
 // PrintModels writes models as an aligned table, keeping only ids that contain
