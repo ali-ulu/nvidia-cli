@@ -13,9 +13,8 @@ type Message struct {
 
 // ChatRequest is the body of POST /chat/completions.
 type ChatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature *float64  `json:"temperature,omitempty"`
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
 }
 
 // Model is one entry from GET /models.

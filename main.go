@@ -9,9 +9,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/ali-ulu/nv/internal/cli"
-	"github.com/ali-ulu/nv/internal/guidelines"
-	"github.com/ali-ulu/nv/internal/nim"
+	"github.com/ali-ulu/nvidia-cli/internal/cli"
+	"github.com/ali-ulu/nvidia-cli/internal/guidelines"
+	"github.com/ali-ulu/nvidia-cli/internal/nim"
 )
 
 const usage = `nv - talk to the NVIDIA NIM API

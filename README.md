@@ -10,7 +10,7 @@ It also ships an embedded set of lean-coding guidelines you can hand to the mode
 ## Install
 
 ```sh
-go install github.com/ali-ulu/nv@latest
+go install github.com/ali-ulu/nvidia-cli@latest
 ```
 
 Or build locally:
