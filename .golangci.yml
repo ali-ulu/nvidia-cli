@@ -1,0 +1,32 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - misspell
+    - unconvert
+    - wastedassign
+  settings:
+    errcheck:
+      # Writing to stdout/stderr has no actionable failure; the fmt print
+      # family is the idiomatic exception.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintln
+        - fmt.Fprintf
+        - (*text/tabwriter.Writer).Flush
+  exclusions:
+    rules:
+      # Test handlers write to httptest.ResponseWriter; the error is irrelevant.
+      - path: _test\.go
+        linters: [errcheck]
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
