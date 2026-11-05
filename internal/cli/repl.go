@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"strings"
 
 	"github.com/ali-ulu/nvidia-cli/internal/guidelines"
@@ -17,6 +19,16 @@ const (
 	cmdReset = ":reset"
 	cmdQuit  = ":quit"
 )
+
+// History budget: the request payload is trimmed to a rough token estimate
+// (4 chars per token) so long sessions do not send an unbounded history.
+const (
+	charsPerToken    = 4
+	maxHistoryTokens = 8000
+)
+
+// maxLineBytes is the per-line stdin limit (the bufio.Scanner default is 64 KiB).
+const maxLineBytes = 1 << 20 // 1 MiB
 
 // REPL is a multi-turn chat session. stdin and stdout are injected so the
 // loop can be driven from a test.
@@ -37,9 +49,12 @@ func NewREPL(client *nim.Client, out io.Writer, model string) *REPL {
 }
 
 // Run reads lines from in until :quit or EOF. Each non-command line is sent
-// as a user turn and the reply is streamed to out. It returns the process
-// exit code (0 on a clean exit).
-func (r *REPL) Run(in io.Reader) int {
+// as a user turn and the reply is streamed to out. SIGINT during a stream
+// cancels only the current turn (the turn is dropped and the prompt returns);
+// at the prompt SIGINT keeps its default terminate-the-process behaviour
+// because the handler is re-armed per turn and released right after. It
+// returns the process exit code (0 on a clean exit).
+func (r *REPL) Run(ctx context.Context, in io.Reader) int {
 	var history []nim.Message
 	if sys := r.systemPrompt(); sys != "" {
 		history = append(history, nim.Message{Role: "system", Content: sys})
@@ -47,6 +62,7 @@ func (r *REPL) Run(in io.Reader) int {
 
 	fmt.Fprintf(r.out, "nv repl — model %s; commands: :model NAME, :reset, :quit\n", r.Model)
 	scanner := bufio.NewScanner(in)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -73,13 +89,30 @@ func (r *REPL) Run(in io.Reader) int {
 			fmt.Fprintln(r.out, "unknown command; try :model NAME, :reset, :quit")
 		default:
 			history = append(history, nim.Message{Role: "user", Content: line})
-			reply, err := r.client.ChatStream(context.Background(), nim.ChatRequest{
+			var dropped int
+			history, dropped = trimHistory(history, maxHistoryTokens)
+			if dropped > 0 {
+				fmt.Fprintf(r.out, "note: trimmed %d oldest turn(s) to fit the context budget\n", dropped/2)
+			}
+			// A fresh signal context per turn: Ctrl+C aborts the current
+			// generation, and the handler is gone again by the next prompt.
+			turnCtx, stopTurn := signal.NotifyContext(ctx, os.Interrupt)
+			reply, err := r.client.ChatStream(turnCtx, nim.ChatRequest{
 				Model:    r.Model,
 				Messages: history,
 			}, func(delta string) error {
 				_, werr := io.WriteString(r.out, delta)
 				return werr
 			})
+			// Check before stop: NotifyContext's stop cancels the context,
+			// so Err() is only meaningful while the handler is live.
+			interrupted := turnCtx.Err() != nil
+			stopTurn()
+			if interrupted {
+				fmt.Fprintln(r.out, "^C")
+				history = history[:len(history)-1] // interrupted turn is not kept
+				continue
+			}
 			fmt.Fprintln(r.out)
 			if err != nil {
 				fmt.Fprintln(r.out, "error:", err)
@@ -106,4 +139,40 @@ func (r *REPL) systemPrompt() string {
 		return g
 	}
 	return r.System
+}
+
+// tokenEstimate gives a coarse token count for a message (~4 chars/token).
+func tokenEstimate(m nim.Message) int {
+	return (len(m.Content) + charsPerToken - 1) / charsPerToken
+}
+
+// trimHistory drops the oldest complete user+assistant turns (after any
+// leading system message) until the estimated token count fits maxTokens.
+// Dropping whole pairs keeps the wire history well formed: the model never
+// sees an assistant reply whose prompting user turn is gone. The system
+// message and the newest turn are never dropped, so a single oversized turn
+// still goes through.
+func trimHistory(msgs []nim.Message, maxTokens int) ([]nim.Message, int) {
+	total := 0
+	for _, m := range msgs {
+		total += tokenEstimate(m)
+	}
+	if total <= maxTokens {
+		return msgs, 0
+	}
+	sys := 0
+	for sys < len(msgs) && msgs[sys].Role == "system" {
+		sys++
+	}
+	dropped := 0
+	for total > maxTokens && len(msgs)-sys-dropped > 1 &&
+		msgs[sys+dropped].Role == "user" && msgs[sys+dropped+1].Role == "assistant" {
+		total -= tokenEstimate(msgs[sys+dropped]) + tokenEstimate(msgs[sys+dropped+1])
+		dropped += 2
+	}
+	// Re-attach the system prefix; the dropped turns are removed from the rest.
+	trimmed := make([]nim.Message, 0, sys+len(msgs)-sys-dropped)
+	trimmed = append(trimmed, msgs[:sys]...)
+	trimmed = append(trimmed, msgs[sys+dropped:]...)
+	return trimmed, dropped
 }

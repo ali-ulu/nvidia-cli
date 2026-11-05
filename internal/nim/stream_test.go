@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -119,5 +120,102 @@ func TestChatStreamOnDeltaErrorStops(t *testing.T) {
 	})
 	if !errors.Is(err, errStop) {
 		t.Fatalf("err = %v, want the onDelta error to propagate", err)
+	}
+}
+
+// noWaitFastClient stubs out the retry sleep and keeps a small attempt budget.
+func noWaitFastClient(t *testing.T, url string) *Client {
+	t.Helper()
+	origWait := wait
+	wait = func(context.Context, time.Duration) error { return nil }
+	t.Cleanup(func() { wait = origWait })
+	c := New("test-key", url)
+	c.maxAttempts = 3
+	return c
+}
+
+func TestChatStreamRetries5xxBeforeFirstToken(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	var deltas []string
+	reply, err := noWaitFastClient(t, srv.URL).ChatStream(context.Background(), ChatRequest{Model: "m"}, func(d string) error {
+		deltas = append(deltas, d)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	if reply != "second" {
+		t.Errorf("reply = %q, want the second attempt's reply", reply)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2", calls)
+	}
+	if strings.Join(deltas, "") != "second" {
+		t.Errorf("deltas = %v, want output only from the successful attempt", deltas)
+	}
+}
+
+func TestChatStreamRetriesTransportErrorBeforeHeaders(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			panic(http.ErrAbortHandler) // kill the connection before any header
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	reply, err := noWaitFastClient(t, srv.URL).ChatStream(context.Background(), ChatRequest{Model: "m"}, nil)
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	if reply != "ok" {
+		t.Errorf("reply = %q, want %q", reply, "ok")
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2", calls)
+	}
+}
+
+func TestChatStreamDoesNotRetryOnceStreamStarted(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) > 1 {
+			t.Errorf("a stream error after 2xx headers must not be retried")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic(http.ErrAbortHandler) // abort mid-stream, after the first token
+	}))
+	defer srv.Close()
+
+	var got []string
+	_, err := noWaitFastClient(t, srv.URL).ChatStream(context.Background(), ChatRequest{Model: "m"}, func(d string) error {
+		got = append(got, d)
+		return nil
+	})
+	if err == nil {
+		t.Fatal("want error from the aborted stream")
+	}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Errorf("calls = %d, want exactly 1 (no retry after stream start)", calls)
+	}
+	if strings.Join(got, "") != "first" {
+		t.Errorf("deltas = %v, want only the first attempt's token", got)
 	}
 }
