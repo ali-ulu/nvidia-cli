@@ -36,10 +36,23 @@ func retryAfter(h http.Header, now time.Time) time.Duration {
 	return 0
 }
 
+// nonRetryable wraps an error that must not trigger another attempt: the
+// response stream was already being consumed, so a retry could replay output
+// the caller has already seen.
+type nonRetryable struct{ err error }
+
+func (e *nonRetryable) Error() string { return e.err.Error() }
+func (e *nonRetryable) Unwrap() error { return e.err }
+
 // retryable reports whether a failed request should be tried again.
-// 401/403/404/410 and other 4xx client errors are permanent; 429, 5xx and
-// transport-level failures are retried.
+// Stream-read failures (nonRetryable) are never retried. 401/403/404/410 and
+// other 4xx client errors are permanent; 429, 5xx and transport-level
+// failures are retried.
 func retryable(err error) bool {
+	var nr *nonRetryable
+	if errors.As(err, &nr) {
+		return false
+	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		return apiErr.Status == http.StatusTooManyRequests || apiErr.Status >= 500

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ioPipe returns a ReadCloser and its write end, for faking stdin.
@@ -272,8 +274,11 @@ func TestConfigCommandWritesAndReads(t *testing.T) {
 	if code := run([]string{"config", "--api-key", testValue("stored"), "--model", "m1"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("write exit = %d, stderr = %s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), testValue("stored")) || !strings.Contains(stdout.String(), "m1") {
-		t.Errorf("write output missing fields:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), maskKey(testValue("stored"))) || !strings.Contains(stdout.String(), "m1") {
+		t.Errorf("write output missing masked fields:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), testValue("stored")) {
+		t.Errorf("write output leaked the full API key:\n%s", stdout.String())
 	}
 
 	stdout.Reset()
@@ -282,6 +287,66 @@ func TestConfigCommandWritesAndReads(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "config file:") || !strings.Contains(stdout.String(), "m1") {
 		t.Errorf("read output missing stored config:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), maskKey(testValue("stored"))) {
+		t.Errorf("read output missing masked API key:\n%s", stdout.String())
+	}
+}
+
+// TestConfigOutputNeverPrintsFullAPIKey runs the config command in read and
+// write mode and asserts the full key value never appears on the terminal.
+func TestConfigOutputNeverPrintsFullAPIKey(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	key := testValue("leak-check") // 21 chars, long enough for head+tail masking
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"write", []string{"config", "--api-key", key, "--model", "m1"}},
+		{"read", []string{"config"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(tc.args, &stdout, &stderr); code != 0 {
+				t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+			}
+			out := stdout.String()
+			if strings.Contains(out, key) {
+				t.Errorf("full API key leaked to stdout:\n%s", out)
+			}
+			if !strings.Contains(out, maskKey(key)) {
+				t.Errorf("output missing masked API key:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestMaskKey covers the masking helper directly, including the empty value
+// marker and keys too short to reveal head and tail safely.
+func TestMaskKey(t *testing.T) {
+	key := testValue("maskme") // "test-value-maskme"
+	want := key[:6] + "****" + key[len(key)-4:]
+	if got := maskKey(key); got != want {
+		t.Errorf("maskKey = %q, want %q", got, want)
+	}
+	if got := maskKey(""); got != "<yok>" {
+		t.Errorf("maskKey(\"\") = %q, want <yok>", got)
+	}
+	if got := maskKey("shortkey12"); got != "****" {
+		t.Errorf("maskKey(short) = %q, want full mask", got)
+	}
+}
+
+func TestConfigReadShowsMarkerWhenKeyEmpty(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // no config file, no key
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"config"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "<yok>") {
+		t.Errorf("empty API key not marked in output:\n%s", stdout.String())
 	}
 }
 
@@ -314,8 +379,101 @@ func TestConfigFileModelUsedAsDefault(t *testing.T) {
 	}
 }
 
+// TestAskRequestTimesOut points ask at a server that stalls longer than the
+// (shortened) request deadline and expects a failed exit that names the
+// deadline, proving the call does not hang on context.Background.
+func TestAskRequestTimesOut(t *testing.T) {
+	old := requestTimeout
+	requestTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { requestTimeout = old })
+
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.Write([]byte(`{"choices":[{"message":{"content":"late"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--base-url", base, "--api-key", "k", "--model", "m", "ping"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("want non-zero exit when the request exceeds the deadline")
+	}
+	if !strings.Contains(stderr.String(), "context deadline exceeded") {
+		t.Errorf("stderr should name the deadline: %q", stderr.String())
+	}
+}
+
+// TestModelsRequestTimesOut checks the same deadline on the models command.
+func TestModelsRequestTimesOut(t *testing.T) {
+	old := requestTimeout
+	requestTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { requestTimeout = old })
+
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.Write([]byte(`{"data":[]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"models", "--base-url", base, "--api-key", "k"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("want non-zero exit when the request exceeds the deadline")
+	}
+	if !strings.Contains(stderr.String(), "context deadline exceeded") {
+		t.Errorf("stderr should name the deadline: %q", stderr.String())
+	}
+}
+
+// TestModelsAndAskUseCancelContext is not a signal test: it only verifies the
+// commands still work end to end while a cancelable context is in place.
+func TestModelsStillWorkWithSignalContext(t *testing.T) {
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"nvidia/nemotron","owned_by":"nvidia"}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"models", "--base-url", base, "--api-key", "k"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "nvidia/nemotron") {
+		t.Errorf("stdout missing model:\n%s", stdout.String())
+	}
+}
+
 // testValue builds a placeholder key at run time so no credential-shaped
 // string literal appears in the source tree.
 func testValue(suffix string) string {
 	return strings.Join([]string{"test", "value", suffix}, "-")
+}
+
+// TestAskStreamOutlivesRequestTimeout proves the streaming path is not bound
+// by the per-request deadline: a generation that trickles deltas well past
+// the (shortened) timeout still completes instead of being cut mid-stream.
+func TestAskStreamOutlivesRequestTimeout(t *testing.T) {
+	old := requestTimeout
+	requestTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { requestTimeout = old })
+
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := 0; i < 5; i++ {
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"chunk%d\"}}]}\n\n", i)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(80 * time.Millisecond) // ~400ms total, 4x the deadline
+		}
+		w.Write([]byte("data: [DONE]\n\n"))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--base-url", base, "--api-key", "k", "--model", "m", "--stream", "ping"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	for i := 0; i < 5; i++ {
+		if !strings.Contains(stdout.String(), fmt.Sprintf("chunk%d", i)) {
+			t.Errorf("stream was cut short: chunk%d missing from %q", i, stdout.String())
+		}
+	}
 }
