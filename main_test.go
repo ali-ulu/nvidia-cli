@@ -249,6 +249,73 @@ func TestAskWithoutGuidelinesSendsOnlyUserMessage(t *testing.T) {
 	}
 }
 
+// TestAskAutoSelectsSkillFromPrompt: with auto-skills on (the default), a
+// prompt that mentions shell commands gets the shell-safe system message
+// without any --skill flag.
+func TestAskAutoSelectsSkillFromPrompt(t *testing.T) {
+	var gotBody string
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--base-url", base, "--api-key", "k", "--model", "m",
+		"what does chmod 644 do"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(gotBody, "safe, non-destructive") {
+		t.Errorf("shell-safe skill not auto-attached:\n%s", gotBody)
+	}
+}
+
+// TestAskNoSkillsDisablesAutoSelection: --no-skills must send no system message
+// even for a prompt that would otherwise trigger one.
+func TestAskNoSkillsDisablesAutoSelection(t *testing.T) {
+	var gotBody string
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--base-url", base, "--api-key", "k", "--model", "m",
+		"--no-skills", "what does chmod 644 do"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if strings.Contains(gotBody, "safe, non-destructive") {
+		t.Errorf("--no-skills still attached a skill:\n%s", gotBody)
+	}
+}
+
+// TestAskAutoSkillsFlagOff: --auto-skills=false keeps explicit --skill but
+// skips prompt-based selection.
+func TestAskAutoSkillsFlagOff(t *testing.T) {
+	var gotBody string
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--base-url", base, "--api-key", "k", "--model", "m",
+		"--auto-skills=false", "--skill", "concise", "what does chmod 644 do"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if strings.Contains(gotBody, "safe, non-destructive") {
+		t.Errorf("auto selection ran despite --auto-skills=false:\n%s", gotBody)
+	}
+	if !strings.Contains(gotBody, "as briefly as possible") {
+		t.Errorf("explicit --skill concise was dropped:\n%s", gotBody)
+	}
+}
+
 func TestAskStreamCommandEndToEnd(t *testing.T) {
 	var gotAccept, gotBody string
 	base := serve(t, func(w http.ResponseWriter, r *http.Request) {

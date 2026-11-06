@@ -69,6 +69,10 @@ nv ask --model nvidia/nemotron-3-super-120b-a12b \
 nv ask --model nvidia/nemotron-3-super-120b-a12b \
   --skill lean-coding --skill concise "Write a retry helper in Go."
 
+# Skills are also selected automatically from the prompt (on by default)
+nv ask "What does chmod 644 do?"          # -> attaches shell-safe
+nv ask --no-skills "What does chmod 644 do?"   # -> attaches nothing
+
 # List the embedded skills (or --json for machine-readable output)
 nv skills
 
@@ -89,6 +93,8 @@ nv guidelines
 | `--stream` | `ask` | stream the reply via SSE as tokens arrive |
 | `--system TEXT` | `ask`, `repl` | optional system prompt |
 | `--skill NAME` | `ask`, `repl` | attach an embedded skill's system prompt (repeatable) |
+| `--auto-skills` | `ask`, `repl` | auto-select skills from the prompt (default on; `--auto-skills=false` to disable) |
+| `--no-skills` | `ask`, `repl` | disable automatic skill selection |
 | `--guidelines` | `ask`, `repl` | attach the embedded coding guidelines (alias of `--skill lean-coding`) |
 | `--json` | `skills` | emit the skill list as JSON |
 
@@ -105,9 +111,8 @@ rather than failing.
 
 ### Skills
 
-A skill is a named, embedded system prompt that `nv ask` and `nv repl` can
-attach with `--skill NAME` (repeatable). `nv skills` lists them and
-`nv skills --json` prints them as JSON. The embedded skills are:
+A skill is a named, embedded system prompt that `nv ask` and `nv repl` attach
+to a request. `nv skills` lists them and `nv skills --json` prints them as JSON.
 
 | Skill | Effect |
 |---|---|
@@ -116,8 +121,19 @@ attach with `--skill NAME` (repeatable). `nv skills` lists them and
 | `turkish` | always reply in Turkish |
 | `shell-safe` | prefer safe, non-destructive shell commands |
 
-An attached skill's text is prepended to the user's own `--system` text, so an
-explicit instruction always wins.
+Skills are attached two ways:
+
+- **Explicitly** with `--skill NAME` (repeatable), on every request.
+- **Automatically** from the prompt (on by default). A skill is attached when
+  the prompt matches one of its triggers, and `turkish` is attached when the
+  prompt is written in Turkish. For example, a prompt mentioning `chmod`
+  attaches `shell-safe`; `kısaca` attaches `concise`. Turn it off with
+  `--no-skills`, or keep explicit `--skill` while skipping auto-selection with
+  `--auto-skills=false`. In `repl` the selection is recomputed each turn, so it
+  tracks the current prompt.
+
+Skill text is prepended to the user's own `--system` text, so an explicit
+instruction always wins.
 
 ### Config file
 

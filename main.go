@@ -38,6 +38,8 @@ Flags:
   --stream         stream the reply token by token (ask)
   --system TEXT    system prompt for ask/repl
   --skill NAME     attach an embedded skill's system prompt (repeatable)
+  --no-skills      disable automatic skill selection
+  --auto-skills    auto-select skills from the prompt (default on)
   --guidelines     attach the embedded coding guidelines (alias of --skill lean-coding)
   --filter TEXT    only show models whose id contains TEXT (models)
   --refresh        force a network fetch and update the model cache (models)
@@ -210,6 +212,8 @@ func runAsk(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	useGuidelines := fs.Bool("guidelines", false, "prepend the embedded coding guidelines")
 	skillsFlag := multiFlag{}
 	fs.Var(&skillsFlag, "skill", "attach an embedded skill (repeatable)")
+	noSkills := fs.Bool("no-skills", false, "disable automatic skill selection")
+	autoSkills := fs.Bool("auto-skills", true, "auto-select skills from the prompt (default on)")
 	stream := fs.Bool("stream", false, "stream the reply token by token")
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -220,11 +224,15 @@ func runAsk(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ask needs a prompt")
 		return 1
 	}
-	names, err := resolveSkills(skillsFlag, *useGuidelines)
+	names, auto, err := resolveSkills(skillsFlag, *useGuidelines, *noSkills, *autoSkills)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	if auto {
+		names = append(names, skills.Auto(prompt)...)
+	}
+	names = skills.Names(names) // de-dupe: an explicit --skill may also be auto-selected
 	name, err := resolveModel(*model)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -294,18 +302,23 @@ func (m *multiFlag) Set(v string) error {
 }
 
 // resolveSkills validates the --skill names and folds in --guidelines as an
-// alias for the lean-coding skill. It returns the names to attach, in order.
-func resolveSkills(skillFlag multiFlag, useGuidelines bool) ([]string, error) {
+// alias for the lean-coding skill. It returns the names to attach explicitly
+// (empty when --no-skills is set), in order, plus whether per-prompt automatic
+// skill selection should be on.
+func resolveSkills(skillFlag multiFlag, useGuidelines, noSkills, autoSkills bool) ([]string, bool, error) {
+	if noSkills {
+		return nil, false, nil
+	}
 	requested := []string(skillFlag)
 	if useGuidelines {
 		requested = append([]string{"lean-coding"}, requested...)
 	}
 	for _, n := range requested {
 		if _, ok := skills.Get(n); !ok {
-			return nil, fmt.Errorf("unknown skill %q; run nv skills to list them", n)
+			return nil, false, fmt.Errorf("unknown skill %q; run nv skills to list them", n)
 		}
 	}
-	return skills.Names(requested), nil
+	return skills.Names(requested), autoSkills, nil
 }
 
 // runSkills lists the embedded skills as a table or, with --json, as JSON.
@@ -335,11 +348,13 @@ func runRepl(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	useGuidelines := fs.Bool("guidelines", false, "prepend the embedded coding guidelines")
 	skillsFlag := multiFlag{}
 	fs.Var(&skillsFlag, "skill", "attach an embedded skill (repeatable)")
+	noSkills := fs.Bool("no-skills", false, "disable automatic skill selection")
+	autoSkills := fs.Bool("auto-skills", true, "auto-select skills from each prompt (default on)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 
-	names, err := resolveSkills(skillsFlag, *useGuidelines)
+	names, auto, err := resolveSkills(skillsFlag, *useGuidelines, *noSkills, *autoSkills)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -358,6 +373,7 @@ func runRepl(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	session := cli.NewREPL(client, stdout, name)
 	session.System = *system
 	session.Skills = names
+	session.AutoSkills = auto
 	return session.Run(ctx, stdin)
 }
 

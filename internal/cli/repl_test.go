@@ -404,7 +404,63 @@ func (errReader) Read([]byte) (int, error) { return 0, errors.New("stdin broke")
 func TestSystemPromptGuidelinesWithoutSystem(t *testing.T) {
 	session := NewREPL(nim.New("k", "http://127.0.0.1:0"), &strings.Builder{}, "m")
 	session.Skills = []string{"lean-coding"}
-	if got, want := session.systemPrompt(), guidelines.SystemPrompt(); got != want {
+	if got, want := session.systemPromptFor("anything"), guidelines.SystemPrompt(); got != want {
 		t.Errorf("systemPrompt = %q..., want the raw guidelines text", got[:min(40, len(got))])
+	}
+}
+
+// TestSystemPromptForAutoSkills covers per-prompt automatic skill selection:
+// the prompt's triggers add the matching skills on top of the explicit ones.
+func TestSystemPromptForAutoSkills(t *testing.T) {
+	session := NewREPL(nim.New("k", "http://127.0.0.1:0"), &strings.Builder{}, "m")
+	session.AutoSkills = true
+	// "shell" triggers shell-safe, "kısaca" triggers concise.
+	got := session.systemPromptFor("bunu kısaca anlat ve shell komutunu göster")
+	if !strings.Contains(got, "safe, non-destructive") {
+		t.Errorf("shell-safe skill not auto-attached:\n%s", got)
+	}
+	if !strings.Contains(got, "as briefly as possible") {
+		t.Errorf("concise skill not auto-attached:\n%s", got)
+	}
+	if !strings.Contains(got, "Turkish") {
+		t.Errorf("turkish skill not auto-attached for a Turkish prompt:\n%s", got)
+	}
+}
+
+// TestSystemPromptForAutoSkillsDisabled: with AutoSkills off, a triggering
+// prompt attaches nothing.
+func TestSystemPromptForAutoSkillsDisabled(t *testing.T) {
+	session := NewREPL(nim.New("k", "http://127.0.0.1:0"), &strings.Builder{}, "m")
+	if got := session.systemPromptFor("write a bash script kısaca"); got != "" {
+		t.Errorf("systemPrompt = %q, want empty when auto-skills is off", got)
+	}
+}
+
+// TestREPLAutoSkillsRecomputedPerTurn: the system message tracks each turn's
+// prompt, so a code turn and a plain turn carry different skills.
+func TestREPLAutoSkillsRecomputedPerTurn(t *testing.T) {
+	var bodies []nim.ChatRequest
+	srv := historyCaptorServer(t, &bodies, "ok")
+	defer srv.Close()
+
+	in := "write a Go function\njust say hello\n:quit\n"
+	session := NewREPL(nim.New("k", srv.URL), &strings.Builder{}, "m")
+	session.AutoSkills = true
+	if code := session.Run(context.Background(), strings.NewReader(in)); code != 0 {
+		t.Fatal("Run exit != 0")
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("chat calls = %d, want 2", len(bodies))
+	}
+	// Turn 1 triggers lean-coding; its system message must be present.
+	if len(bodies[0].Messages) == 0 || bodies[0].Messages[0].Role != "system" ||
+		!strings.Contains(bodies[0].Messages[0].Content, "engineering guidelines") {
+		t.Errorf("turn-1 system message missing lean-coding: %+v", bodies[0].Messages)
+	}
+	// Turn 2 ("just say hello") triggers nothing, so no system message.
+	for _, m := range bodies[1].Messages {
+		if m.Role == "system" {
+			t.Errorf("turn-2 carried an unexpected system message: %+v", m)
+		}
 	}
 }
