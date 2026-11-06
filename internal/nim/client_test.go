@@ -74,6 +74,22 @@ func TestChatWithoutChoicesFails(t *testing.T) {
 	}
 }
 
+// TestChatPropagatesRequestError covers the branch where the underlying request
+// fails: Chat must surface that error instead of returning a partial reply.
+func TestChatPropagatesRequestError(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"bad key"}`))
+	})
+	reply, err := c.Chat(context.Background(), ChatRequest{Model: "m"})
+	if err == nil {
+		t.Fatal("want error for a 401 response")
+	}
+	if reply != "" {
+		t.Errorf("reply = %q, want empty on error", reply)
+	}
+}
+
 func TestNon2xxReturnsAPIError(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -121,5 +137,55 @@ func TestNewDefaultsBaseURL(t *testing.T) {
 	}
 	if got := New("k", "http://x/v1/").baseURL; got != "http://x/v1" {
 		t.Errorf("trailing slash not trimmed: %q", got)
+	}
+}
+
+// TestDoEncodeRequestError covers the marshal failure path: a body that cannot
+// be encoded as JSON must fail before any request is built. The retry sleep is
+// stubbed out because an encode failure is retryable.
+func TestDoEncodeRequestError(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {})
+	c = noWaitFastClientOn(t, c)
+	err := c.do(context.Background(), http.MethodPost, "/chat/completions", make(chan int), nil)
+	if err == nil || !strings.Contains(err.Error(), "encode request") {
+		t.Fatalf("err = %v, want an encode-request error", err)
+	}
+}
+
+// TestDoBuildRequestError covers the http.NewRequestWithContext failure path: an
+// invalid method is rejected before the call is sent. The retry sleep is stubbed
+// out because a build failure is retryable.
+func TestDoBuildRequestError(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {})
+	c = noWaitFastClientOn(t, c)
+	err := c.do(context.Background(), "BAD METHOD", "/models", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "build request") {
+		t.Fatalf("err = %v, want a build-request error", err)
+	}
+}
+
+// TestDoNilOutSkipsDecode covers the out == nil branch: a successful response
+// with no destination must not attempt to decode the payload.
+func TestDoNilOutSkipsDecode(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"a","owned_by":"x"}]}`))
+	})
+	if err := c.do(context.Background(), http.MethodGet, "/models", nil, nil); err != nil {
+		t.Fatalf("do(out=nil) = %v, want nil", err)
+	}
+}
+
+// TestDoReadResponseError covers the io.ReadAll failure path: the server
+// advertises a body longer than it sends, so the read fails with unexpected EOF.
+// The retry sleep is stubbed out because a read failure is retryable.
+func TestDoReadResponseError(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.Write([]byte(`{"data":`)) // 8 bytes, far short of the advertised 100
+	})
+	c = noWaitFastClientOn(t, c)
+	err := c.do(context.Background(), http.MethodGet, "/models", nil, new(modelsResponse))
+	if err == nil || !strings.Contains(err.Error(), "read /models response") {
+		t.Fatalf("err = %v, want a read-response error", err)
 	}
 }

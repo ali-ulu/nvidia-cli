@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -444,6 +445,247 @@ func TestModelsStillWorkWithSignalContext(t *testing.T) {
 // string literal appears in the source tree.
 func testValue(suffix string) string {
 	return strings.Join([]string{"test", "value", suffix}, "-")
+}
+
+// TestNoArgsPrintsUsage covers the empty-argument branch: run prints usage to
+// stderr and exits non-zero.
+func TestNoArgsPrintsUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run(nil, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "Usage:") {
+		t.Errorf("stderr missing usage:\n%s", stderr.String())
+	}
+}
+
+// TestHelpCommandPrintsUsage covers the help/-h/--help branch, which writes the
+// usage to stdout and exits 0.
+func TestHelpCommandPrintsUsage(t *testing.T) {
+	for _, arg := range []string{"help", "-h", "--help"} {
+		t.Run(arg, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{arg}, &stdout, &stderr); code != 0 {
+				t.Fatalf("exit = %d, want 0", code)
+			}
+			if !strings.Contains(stdout.String(), "Usage:") {
+				t.Errorf("stdout missing usage:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+// TestFlagParseErrorsExit covers the flag-parsing failure branch shared by every
+// subcommand: an unknown flag makes the command exit non-zero after printing the
+// usage, and the custom usage func runs.
+func TestFlagParseErrorsExit(t *testing.T) {
+	for _, cmd := range []string{"models", "ask", "repl", "config"} {
+		t.Run(cmd, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{cmd, "--definitely-not-a-flag"}, &stdout, &stderr); code != 1 {
+				t.Fatalf("exit = %d, want 1", code)
+			}
+			if !strings.Contains(stderr.String(), "Usage:") {
+				t.Errorf("stderr missing usage after a parse error:\n%s", stderr.String())
+			}
+		})
+	}
+}
+
+// TestAskConnectionErrorWhenKeyMissing covers the branch where the prompt and
+// model resolve but no API key is available: the connection step fails and its
+// error reaches stderr.
+func TestAskConnectionErrorWhenKeyMissing(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("NVIDIA_API_KEY", "")
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--model", "m", "hello"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "no API key") {
+		t.Errorf("stderr = %q, want a no-API-key error", stderr.String())
+	}
+}
+
+// TestReplConnectionErrorWhenKeyMissing covers the same connection failure on
+// the repl command.
+func TestReplConnectionErrorWhenKeyMissing(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("NVIDIA_API_KEY", "")
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"repl", "--model", "m"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "no API key") {
+		t.Errorf("stderr = %q, want a no-API-key error", stderr.String())
+	}
+}
+
+// TestReplRequiresModel covers the branch where repl cannot resolve a model:
+// with no --model and no config file it fails before any connection.
+func TestReplRequiresModel(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"repl"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "no model") {
+		t.Errorf("stderr = %q, want a no-model error", stderr.String())
+	}
+}
+
+// TestAskStreamErrorExits covers the streaming failure branch: a 401 on the
+// streamed request is reported and the command exits non-zero.
+func TestAskStreamErrorExits(t *testing.T) {
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"bad key"}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--base-url", base, "--api-key", "k", "--model", "m", "--stream", "ping"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "401") {
+		t.Errorf("stderr = %q, want the 401 status", stderr.String())
+	}
+}
+
+// TestMessagesGuidelinesWithoutSystem covers the branch where --guidelines is set
+// but no --system text is given: the guidelines become the sole system message.
+func TestMessagesGuidelinesWithoutSystem(t *testing.T) {
+	msgs := messages("", true, "ping")
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %+v, want system+user", msgs)
+	}
+	if msgs[0].Role != "system" || !strings.Contains(msgs[0].Content, "engineering guidelines") {
+		t.Errorf("system message = %+v, want the guidelines", msgs[0])
+	}
+	if msgs[1].Role != "user" || msgs[1].Content != "ping" {
+		t.Errorf("user message = %+v, want {user ping}", msgs[1])
+	}
+}
+
+// TestConfigWriteBaseURL covers the branch that stores a base URL from flags.
+func TestConfigWriteBaseURL(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"config", "--base-url", "http://example.invalid/v1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "http://example.invalid/v1") {
+		t.Errorf("stdout missing the stored base URL:\n%s", stdout.String())
+	}
+}
+
+// TestConfigSaveErrorExits covers the branch where the config cannot be written:
+// a read-only config home lets LoadConfig treat the missing file as empty but
+// makes SaveConfig fail, and the command reports it. Unix-only, matching the
+// permission tests in the cli package.
+func TestConfigSaveErrorExits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits are not modelled on Windows")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil { // no write permission
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"config", "--model", "m"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "create config directory") {
+		t.Errorf("stderr = %q, want a config-directory error", stderr.String())
+	}
+}
+
+// TestConnectionFailsWhenConfigUnresolvable covers the branch where connection
+// cannot load the config: with neither XDG_CONFIG_HOME nor HOME set, the config
+// location cannot be resolved and the command fails.
+func TestConnectionFailsWhenConfigUnresolvable(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+	t.Setenv("NVIDIA_API_KEY", "k") // a key is present; the config load still fails
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"models"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "resolve home directory") {
+		t.Errorf("stderr = %q, want a home-directory error", stderr.String())
+	}
+}
+
+// TestResolveModelFailsWhenConfigUnresolvable covers resolveModel's error
+// branch: with no --model and an unresolvable config, ask fails before it
+// connects.
+func TestResolveModelFailsWhenConfigUnresolvable(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "hello"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "resolve home directory") {
+		t.Errorf("stderr = %q, want a home-directory error", stderr.String())
+	}
+}
+
+// TestConfigFailsWhenConfigUnresolvable covers runConfig's config-load error
+// branch: with an unresolvable config location the command fails.
+func TestConfigFailsWhenConfigUnresolvable(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"config"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "resolve home directory") {
+		t.Errorf("stderr = %q, want a home-directory error", stderr.String())
+	}
+}
+
+// TestConfigBaseURLUsedWhenNoFlag covers the branch where no --base-url flag is
+// given: the base URL stored in the config file is used for the request.
+func TestConfigBaseURLUsedWhenNoFlag(t *testing.T) {
+	var hit bool
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.Write([]byte(`{"data":[{"id":"nvidia/nemotron","owned_by":"nvidia"}]}`))
+	})
+
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	cfgPath := filepath.Join(dir, "nv", "config.json")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{"base_url":"`+base+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// No --base-url: the configured one must be picked up.
+	if code := run([]string{"models", "--api-key", "k"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !hit {
+		t.Error("request did not reach the base URL from the config file")
+	}
+	if !strings.Contains(stdout.String(), "nvidia/nemotron") {
+		t.Errorf("stdout missing model:\n%s", stdout.String())
+	}
 }
 
 // TestAskStreamOutlivesRequestTimeout proves the streaming path is not bound

@@ -3,12 +3,14 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/ali-ulu/nvidia-cli/internal/guidelines"
 	"github.com/ali-ulu/nvidia-cli/internal/nim"
 )
 
@@ -316,5 +318,93 @@ func TestREPLAcceptsLongInputLine(t *testing.T) {
 	}
 	if got := bodies[0].Messages[0].Content; got != line {
 		t.Errorf("long line not delivered intact: got %d chars, want %d", len(got), len(line))
+	}
+}
+
+// TestREPLIgnoresBlankLines covers the empty-line branch: blank input between
+// turns is skipped and never becomes a chat request.
+func TestREPLIgnoresBlankLines(t *testing.T) {
+	var bodies []nim.ChatRequest
+	srv := historyCaptorServer(t, &bodies, "ok")
+	defer srv.Close()
+
+	in := "\n   \nhello\n\t\n:quit\n"
+	if code := NewREPL(nim.New("k", srv.URL), &strings.Builder{}, "m").Run(context.Background(), strings.NewReader(in)); code != 0 {
+		t.Fatal("Run exit != 0")
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("chat calls = %d, want 1 (blank lines skipped)", len(bodies))
+	}
+	if bodies[0].Messages[0].Content != "hello" {
+		t.Errorf("message = %q, want hello", bodies[0].Messages[0].Content)
+	}
+}
+
+// TestREPLExitsCleanlyOnEOF covers the end-of-input branch: reaching EOF
+// without :quit still exits 0 (the scanner simply stops).
+func TestREPLExitsCleanlyOnEOF(t *testing.T) {
+	var bodies []nim.ChatRequest
+	srv := historyCaptorServer(t, &bodies, "ok")
+	defer srv.Close()
+
+	if code := NewREPL(nim.New("k", srv.URL), &strings.Builder{}, "m").Run(context.Background(), strings.NewReader("hello\n")); code != 0 {
+		t.Fatalf("Run exit = %d, want 0 on EOF", code)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("chat calls = %d, want 1", len(bodies))
+	}
+}
+
+// TestREPLResetReappliesSystemPrompt covers the :reset branch that re-seeds the
+// history with the system message: the next turn must still lead with it.
+func TestREPLResetReappliesSystemPrompt(t *testing.T) {
+	var bodies []nim.ChatRequest
+	srv := historyCaptorServer(t, &bodies, "ok")
+	defer srv.Close()
+
+	in := "hello\n:reset\nagain\n:quit\n"
+	session := NewREPL(nim.New("k", srv.URL), &strings.Builder{}, "m")
+	session.System = "stay put"
+	if code := session.Run(context.Background(), strings.NewReader(in)); code != 0 {
+		t.Fatal("Run exit != 0")
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("chat calls = %d, want 2", len(bodies))
+	}
+	// After :reset the second request must carry only the system message and the
+	// new user turn — the first turn's history is gone.
+	last := bodies[1]
+	if len(last.Messages) != 2 || last.Messages[0].Role != "system" || last.Messages[0].Content != "stay put" {
+		t.Errorf("system prompt not re-applied after :reset: %+v", last.Messages)
+	}
+	if last.Messages[1].Content != "again" {
+		t.Errorf("second turn = %+v, want only the new user message", last.Messages[1])
+	}
+}
+
+// TestREPLReadErrorReturnsOne covers the scanner-error branch: an input reader
+// that fails mid-scan makes Run report a read error and exit non-zero.
+func TestREPLReadErrorReturnsOne(t *testing.T) {
+	var out strings.Builder
+	if code := NewREPL(nim.New("k", "http://127.0.0.1:0"), &out, "m").Run(context.Background(), errReader{}); code != 1 {
+		t.Fatalf("Run exit = %d, want 1 on a read error", code)
+	}
+	if !strings.Contains(out.String(), "read error:") {
+		t.Errorf("missing read-error notice:\n%s", out.String())
+	}
+}
+
+// errReader fails on its first read, simulating a broken stdin.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("stdin broke") }
+
+// TestSystemPromptGuidelinesWithoutSystem covers the branch where guidelines are
+// on but no custom system prompt is set: the guidelines text is used verbatim.
+func TestSystemPromptGuidelinesWithoutSystem(t *testing.T) {
+	session := NewREPL(nim.New("k", "http://127.0.0.1:0"), &strings.Builder{}, "m")
+	session.UseGuidelines = true
+	if got, want := session.systemPrompt(), guidelines.Text(); got != want {
+		t.Errorf("systemPrompt = %q..., want the raw guidelines text", got[:min(40, len(got))])
 	}
 }

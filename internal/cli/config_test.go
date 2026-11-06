@@ -105,3 +105,80 @@ func TestLoadConfigMalformedFileFails(t *testing.T) {
 func testValue(suffix string) string {
 	return strings.Join([]string{"test", "value", suffix}, "-")
 }
+
+// TestConfigPathFallsBackToHome covers the branch taken when XDG_CONFIG_HOME is
+// unset: the path is derived from the user's home directory instead.
+func TestConfigPathFallsBackToHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", home)
+
+	got, err := ConfigPath()
+	if err != nil {
+		t.Fatalf("ConfigPath: %v", err)
+	}
+	want := filepath.Join(home, ".config", "nv", "config.json")
+	if got != want {
+		t.Errorf("ConfigPath = %q, want %q", got, want)
+	}
+}
+
+// TestConfigPathErrorsWithoutHome covers the error branch: with neither
+// XDG_CONFIG_HOME nor HOME set, ConfigPath cannot resolve a location.
+func TestConfigPathErrorsWithoutHome(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+
+	if _, err := ConfigPath(); err == nil {
+		t.Fatal("want an error when neither XDG_CONFIG_HOME nor HOME is set")
+	}
+}
+
+// TestLoadConfigPropagatesPathError covers LoadConfig's early return when the
+// config location itself cannot be resolved.
+func TestLoadConfigPropagatesPathError(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("want an error when the config path cannot be resolved")
+	}
+}
+
+// TestLoadConfigUnreadableFileFails covers the read-error branch (a path that
+// exists but is not a readable file): a directory at the config path is not
+// ErrNotExist, so it must surface as an error.
+func TestLoadConfigUnreadableFileFails(t *testing.T) {
+	path := withConfig(t)
+	if err := os.MkdirAll(path, 0o700); err != nil { // a directory, not a file
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("want an error when the config path is a directory")
+	}
+}
+
+// TestSaveConfigPropagatesPathError covers SaveConfig's early return when the
+// config location cannot be resolved.
+func TestSaveConfigPropagatesPathError(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+
+	if err := SaveConfig(Config{Model: "m"}); err == nil {
+		t.Fatal("want an error when the config path cannot be resolved")
+	}
+}
+
+// TestSaveConfigMkdirErrorFails covers the branch where the config directory
+// cannot be created: a regular file occupies the path the directory needs.
+func TestSaveConfigMkdirErrorFails(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	// A file where the "nv" directory must go makes MkdirAll fail.
+	if err := os.WriteFile(filepath.Join(dir, "nv"), []byte("blocker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveConfig(Config{Model: "m"}); err == nil {
+		t.Fatal("want an error when the config directory cannot be created")
+	}
+}

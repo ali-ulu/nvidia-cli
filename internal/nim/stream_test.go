@@ -126,10 +126,17 @@ func TestChatStreamOnDeltaErrorStops(t *testing.T) {
 // noWaitFastClient stubs out the retry sleep and keeps a small attempt budget.
 func noWaitFastClient(t *testing.T, url string) *Client {
 	t.Helper()
+	c := New("test-key", url)
+	return noWaitFastClientOn(t, c)
+}
+
+// noWaitFastClientOn stubs out the retry sleep on an existing client and keeps
+// a small attempt budget, so retryable failures do not sleep for real.
+func noWaitFastClientOn(t *testing.T, c *Client) *Client {
+	t.Helper()
 	origWait := wait
 	wait = func(context.Context, time.Duration) error { return nil }
 	t.Cleanup(func() { wait = origWait })
-	c := New("test-key", url)
 	c.maxAttempts = 3
 	return c
 }
@@ -217,5 +224,89 @@ func TestChatStreamDoesNotRetryOnceStreamStarted(t *testing.T) {
 	}
 	if strings.Join(got, "") != "first" {
 		t.Errorf("deltas = %v, want only the first attempt's token", got)
+	}
+}
+
+// TestConsumeSSESkipsEmptyAndNonDataLines covers the branches consumeSSE takes
+// before decoding: comment/blank lines are skipped and a delta with empty
+// content is ignored rather than emitted.
+func TestConsumeSSESkipsEmptyAndNonDataLines(t *testing.T) {
+	body := ": keepalive\n" +
+		"\n" +
+		"event: message\n" +
+		"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" + // empty content
+		"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	var deltas []string
+	full, err := consumeSSE(strings.NewReader(body), "/chat/completions", func(d string) error {
+		deltas = append(deltas, d)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("consumeSSE: %v", err)
+	}
+	if full != "hi" {
+		t.Errorf("full = %q, want hi", full)
+	}
+	if len(deltas) != 1 || deltas[0] != "hi" {
+		t.Errorf("deltas = %v, want exactly [hi]", deltas)
+	}
+}
+
+// TestConsumeSSEMalformedChunkFails covers the JSON decode failure branch: a
+// data: line whose payload is not valid JSON must surface a decode error that
+// names the stream, while still returning the text assembled so far.
+func TestConsumeSSEMalformedChunkFails(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+		"data: {not json}\n\n"
+	var deltas []string
+	full, err := consumeSSE(strings.NewReader(body), "/chat/completions", func(d string) error {
+		deltas = append(deltas, d)
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "decode /chat/completions stream chunk") {
+		t.Fatalf("err = %v, want a decode-stream-chunk error", err)
+	}
+	if full != "ok" {
+		t.Errorf("full = %q, want the deltas decoded before the bad chunk", full)
+	}
+	if len(deltas) != 1 || deltas[0] != "ok" {
+		t.Errorf("deltas = %v, want [ok]", deltas)
+	}
+}
+
+// TestStreamEncodeRequestError covers the top-level marshal failure in stream:
+// a body that cannot be encoded must fail before any request is made.
+func TestStreamEncodeRequestError(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {})
+	if _, err := c.stream(context.Background(), "/chat/completions", make(chan int), nil); err == nil || !strings.Contains(err.Error(), "encode request") {
+		t.Fatalf("err = %v, want an encode-request error", err)
+	}
+}
+
+// TestStreamBuildRequestError covers the request-construction failure in the
+// stream loop: a base URL carrying a control character is rejected by
+// http.NewRequestWithContext before the call is sent. The retry sleep is stubbed
+// out because a build failure is retryable.
+func TestStreamBuildRequestError(t *testing.T) {
+	c := noWaitFastClientOn(t, New("k", "http://\x7f.invalid"))
+	if _, err := c.stream(context.Background(), "/chat/completions", ChatRequest{Model: "m"}, nil); err == nil || !strings.Contains(err.Error(), "build request") {
+		t.Fatalf("err = %v, want a build-request error", err)
+	}
+}
+
+// TestStreamNon2xxReadError covers the branch where a non-2xx response body
+// cannot be read: the read error is surfaced instead of an APIError. The retry
+// sleep is stubbed out because a 5xx is retryable.
+func TestStreamNon2xxReadError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"err`)) // shorter than advertised, so the read fails
+	}))
+	defer srv.Close()
+
+	_, err := noWaitFastClient(t, srv.URL).ChatStream(context.Background(), ChatRequest{Model: "m"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "read /chat/completions response") {
+		t.Fatalf("err = %v, want a read-response error", err)
 	}
 }
