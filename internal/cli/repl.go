@@ -9,8 +9,8 @@ import (
 	"os/signal"
 	"strings"
 
-	"github.com/ali-ulu/nvidia-cli/internal/guidelines"
 	"github.com/ali-ulu/nvidia-cli/internal/nim"
+	"github.com/ali-ulu/nvidia-cli/internal/skills"
 )
 
 // REPL commands.
@@ -39,8 +39,13 @@ type REPL struct {
 	Model string
 	// System, when set, is sent as the first message of every turn.
 	System string
-	// UseGuidelines prepends the embedded lean-coding guidelines to System.
-	UseGuidelines bool
+	// Skills are the names of embedded skills whose system text is prepended
+	// to System. They are attached to every turn.
+	Skills []string
+	// AutoSkills enables per-prompt automatic skill selection: on top of
+	// Skills, the skills whose triggers match each prompt (see skills.Auto)
+	// are attached for that turn.
+	AutoSkills bool
 }
 
 // NewREPL returns a session that talks through client and prints to out.
@@ -56,9 +61,6 @@ func NewREPL(client *nim.Client, out io.Writer, model string) *REPL {
 // returns the process exit code (0 on a clean exit).
 func (r *REPL) Run(ctx context.Context, in io.Reader) int {
 	var history []nim.Message
-	if sys := r.systemPrompt(); sys != "" {
-		history = append(history, nim.Message{Role: "system", Content: sys})
-	}
 
 	fmt.Fprintf(r.out, "nv repl — model %s; commands: :model NAME, :reset, :quit\n", r.Model)
 	scanner := bufio.NewScanner(in)
@@ -73,9 +75,6 @@ func (r *REPL) Run(ctx context.Context, in io.Reader) int {
 			return 0
 		case line == cmdReset:
 			history = nil
-			if sys := r.systemPrompt(); sys != "" {
-				history = append(history, nim.Message{Role: "system", Content: sys})
-			}
 			fmt.Fprintln(r.out, "history cleared")
 		case strings.HasPrefix(line, cmdModel+" "):
 			name := strings.TrimSpace(strings.TrimPrefix(line, cmdModel))
@@ -88,6 +87,9 @@ func (r *REPL) Run(ctx context.Context, in io.Reader) int {
 		case strings.HasPrefix(line, ":"):
 			fmt.Fprintln(r.out, "unknown command; try :model NAME, :reset, :quit")
 		default:
+			// The system message is rebuilt per turn so auto-selected skills
+			// (see AutoSkills) match the current prompt.
+			history = setSystem(history, r.systemPromptFor(line))
 			history = append(history, nim.Message{Role: "user", Content: line})
 			var dropped int
 			history, dropped = trimHistory(history, maxHistoryTokens)
@@ -129,16 +131,39 @@ func (r *REPL) Run(ctx context.Context, in io.Reader) int {
 	return 0
 }
 
-// systemPrompt assembles the configured system message, if any.
-func (r *REPL) systemPrompt() string {
-	if r.UseGuidelines {
-		g := guidelines.Text()
-		if r.System != "" {
-			return g + "\n\n" + r.System
-		}
-		return g
+// systemPromptFor assembles the system message for one turn: the skills'
+// text first, then the user's own System text. The skills are the explicitly
+// attached ones (r.Skills) plus, when AutoSkills is on, those the prompt
+// triggers (skills.Auto). An explicit instruction in System always comes last,
+// so it wins over any skill.
+func (r *REPL) systemPromptFor(prompt string) string {
+	names := r.Skills
+	if r.AutoSkills {
+		names = append(append([]string{}, names...), skills.Auto(prompt)...)
 	}
-	return r.System
+	system := r.System
+	if combined := skills.Combine(names); combined != "" {
+		if system != "" {
+			system = combined + "\n\n" + system
+		} else {
+			system = combined
+		}
+	}
+	return system
+}
+
+// setSystem replaces any leading system message in msgs with one carrying
+// content (dropping it when content is empty), leaving the rest untouched.
+func setSystem(msgs []nim.Message, content string) []nim.Message {
+	i := 0
+	for i < len(msgs) && msgs[i].Role == "system" {
+		i++
+	}
+	out := make([]nim.Message, 0, 1+len(msgs)-i)
+	if content != "" {
+		out = append(out, nim.Message{Role: "system", Content: content})
+	}
+	return append(out, msgs[i:]...)
 }
 
 // tokenEstimate gives a coarse token count for a message (~4 chars/token).

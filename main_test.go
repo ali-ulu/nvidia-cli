@@ -9,15 +9,41 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ali-ulu/nvidia-cli/internal/cli"
+	"github.com/ali-ulu/nvidia-cli/internal/nim"
 )
+
+// TestMain isolates the on-disk model cache and config from the developer's real
+// home so the suite neither reads nor writes ~/.cache or ~/.config. Individual
+// tests override these with t.Setenv when they need a specific layout.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "nv-test-home")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "create temp home:", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(dir)
+	os.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
+	os.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
+	os.Exit(m.Run())
+}
 
 // ioPipe returns a ReadCloser and its write end, for faking stdin.
 func ioPipe() (io.ReadCloser, io.WriteCloser) {
 	pr, pw := io.Pipe()
 	return pr, pw
+}
+
+// isolateCache points the model cache at a fresh temp dir so a test starts with
+// no cache and cannot observe another test's cached list.
+func isolateCache(t *testing.T) {
+	t.Helper()
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 }
 
 // serve starts a real HTTP server and returns its base URL.
@@ -29,6 +55,7 @@ func serve(t *testing.T, h http.HandlerFunc) string {
 }
 
 func TestModelsCommandEndToEnd(t *testing.T) {
+	isolateCache(t)
 	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/models" {
 			t.Errorf("path = %q, want /models", r.URL.Path)
@@ -78,30 +105,43 @@ func TestAskCommandEndToEnd(t *testing.T) {
 	}
 }
 
-func TestAskRequiresPromptAndModel(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		args []string
-		want string
-	}{
-		{"no prompt", []string{"ask", "--model", "m"}, "needs a prompt"},
-		{"no model", []string{"ask", "hello"}, "no model"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // isolate from any real config
-			var stdout, stderr bytes.Buffer
-			code := run(tc.args, &stdout, &stderr)
-			if code == 0 {
-				t.Fatalf("want non-zero exit")
-			}
-			if !strings.Contains(stderr.String(), tc.want) {
-				t.Errorf("stderr = %q, want %q", stderr.String(), tc.want)
-			}
-		})
+func TestAskRequiresPrompt(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // isolate from any real config
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--model", "m"}, &stdout, &stderr); code == 0 {
+		t.Fatalf("want non-zero exit without a prompt")
+	}
+	if !strings.Contains(stderr.String(), "needs a prompt") {
+		t.Errorf("stderr = %q, want a prompt error", stderr.String())
+	}
+}
+
+// TestAskFallsBackToDefaultModel covers the model priority chain: with no
+// --model and no config file, ask uses the built-in default rather than failing.
+func TestAskFallsBackToDefaultModel(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	var gotModel string
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotModel = body.Model
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--base-url", base, "--api-key", "k", "hello"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if gotModel != nim.DefaultModel {
+		t.Errorf("model = %q, want the default %q", gotModel, nim.DefaultModel)
 	}
 }
 
 func TestMissingAPIKeyFails(t *testing.T) {
+	isolateCache(t)
 	t.Setenv("NVIDIA_API_KEY", "")
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"models"}, &stdout, &stderr)
@@ -121,6 +161,7 @@ func TestUnknownCommandFails(t *testing.T) {
 }
 
 func TestAPIErrorSurfacesToStderr(t *testing.T) {
+	isolateCache(t)
 	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error":"invalid key"}`))
@@ -205,6 +246,73 @@ func TestAskWithoutGuidelinesSendsOnlyUserMessage(t *testing.T) {
 	}
 	if strings.Contains(gotBody, "engineering guidelines") {
 		t.Error("guidelines leaked into a request that did not ask for them")
+	}
+}
+
+// TestAskAutoSelectsSkillFromPrompt: with auto-skills on (the default), a
+// prompt that mentions shell commands gets the shell-safe system message
+// without any --skill flag.
+func TestAskAutoSelectsSkillFromPrompt(t *testing.T) {
+	var gotBody string
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--base-url", base, "--api-key", "k", "--model", "m",
+		"what does chmod 644 do"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(gotBody, "safe, non-destructive") {
+		t.Errorf("shell-safe skill not auto-attached:\n%s", gotBody)
+	}
+}
+
+// TestAskNoSkillsDisablesAutoSelection: --no-skills must send no system message
+// even for a prompt that would otherwise trigger one.
+func TestAskNoSkillsDisablesAutoSelection(t *testing.T) {
+	var gotBody string
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--base-url", base, "--api-key", "k", "--model", "m",
+		"--no-skills", "what does chmod 644 do"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if strings.Contains(gotBody, "safe, non-destructive") {
+		t.Errorf("--no-skills still attached a skill:\n%s", gotBody)
+	}
+}
+
+// TestAskAutoSkillsFlagOff: --auto-skills=false keeps explicit --skill but
+// skips prompt-based selection.
+func TestAskAutoSkillsFlagOff(t *testing.T) {
+	var gotBody string
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--base-url", base, "--api-key", "k", "--model", "m",
+		"--auto-skills=false", "--skill", "concise", "what does chmod 644 do"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if strings.Contains(gotBody, "safe, non-destructive") {
+		t.Errorf("auto selection ran despite --auto-skills=false:\n%s", gotBody)
+	}
+	if !strings.Contains(gotBody, "as briefly as possible") {
+		t.Errorf("explicit --skill concise was dropped:\n%s", gotBody)
 	}
 }
 
@@ -404,6 +512,7 @@ func TestAskRequestTimesOut(t *testing.T) {
 
 // TestModelsRequestTimesOut checks the same deadline on the models command.
 func TestModelsRequestTimesOut(t *testing.T) {
+	isolateCache(t)
 	old := requestTimeout
 	requestTimeout = 50 * time.Millisecond
 	t.Cleanup(func() { requestTimeout = old })
@@ -426,6 +535,7 @@ func TestModelsRequestTimesOut(t *testing.T) {
 // TestModelsAndAskUseCancelContext is not a signal test: it only verifies the
 // commands still work end to end while a cancelable context is in place.
 func TestModelsStillWorkWithSignalContext(t *testing.T) {
+	isolateCache(t)
 	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"data":[{"id":"nvidia/nemotron","owned_by":"nvidia"}]}`))
 	})
@@ -444,6 +554,256 @@ func TestModelsStillWorkWithSignalContext(t *testing.T) {
 // string literal appears in the source tree.
 func testValue(suffix string) string {
 	return strings.Join([]string{"test", "value", suffix}, "-")
+}
+
+// TestNoArgsPrintsUsage covers the empty-argument branch: run prints usage to
+// stderr and exits non-zero.
+func TestNoArgsPrintsUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run(nil, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "Usage:") {
+		t.Errorf("stderr missing usage:\n%s", stderr.String())
+	}
+}
+
+// TestHelpCommandPrintsUsage covers the help/-h/--help branch, which writes the
+// usage to stdout and exits 0.
+func TestHelpCommandPrintsUsage(t *testing.T) {
+	for _, arg := range []string{"help", "-h", "--help"} {
+		t.Run(arg, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{arg}, &stdout, &stderr); code != 0 {
+				t.Fatalf("exit = %d, want 0", code)
+			}
+			if !strings.Contains(stdout.String(), "Usage:") {
+				t.Errorf("stdout missing usage:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+// TestFlagParseErrorsExit covers the flag-parsing failure branch shared by every
+// subcommand: an unknown flag makes the command exit non-zero after printing the
+// usage, and the custom usage func runs.
+func TestFlagParseErrorsExit(t *testing.T) {
+	for _, cmd := range []string{"models", "ask", "repl", "config"} {
+		t.Run(cmd, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{cmd, "--definitely-not-a-flag"}, &stdout, &stderr); code != 1 {
+				t.Fatalf("exit = %d, want 1", code)
+			}
+			if !strings.Contains(stderr.String(), "Usage:") {
+				t.Errorf("stderr missing usage after a parse error:\n%s", stderr.String())
+			}
+		})
+	}
+}
+
+// TestAskConnectionErrorWhenKeyMissing covers the branch where the prompt and
+// model resolve but no API key is available: the connection step fails and its
+// error reaches stderr.
+func TestAskConnectionErrorWhenKeyMissing(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("NVIDIA_API_KEY", "")
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--model", "m", "hello"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "no API key") {
+		t.Errorf("stderr = %q, want a no-API-key error", stderr.String())
+	}
+}
+
+// TestReplConnectionErrorWhenKeyMissing covers the same connection failure on
+// the repl command.
+func TestReplConnectionErrorWhenKeyMissing(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("NVIDIA_API_KEY", "")
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"repl", "--model", "m"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "no API key") {
+		t.Errorf("stderr = %q, want a no-API-key error", stderr.String())
+	}
+}
+
+// TestReplUsesDefaultModel covers the branch where repl resolves no explicit
+// model: it falls back to the built-in default before connecting. The connection
+// then fails on a bad key, which is enough to prove the model resolved.
+func TestReplUsesDefaultModel(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	// No --api-key and no config key: the command stops at key resolution, which
+	// happens after model resolution, so reaching the key error proves the model
+	// did not block it.
+	if code := run([]string{"repl"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if strings.Contains(stderr.String(), "no model") {
+		t.Errorf("stderr = %q, should not be a no-model error", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "API key") {
+		t.Errorf("stderr = %q, want an API-key error", stderr.String())
+	}
+}
+
+// TestAskStreamErrorExits covers the streaming failure branch: a 401 on the
+// streamed request is reported and the command exits non-zero.
+func TestAskStreamErrorExits(t *testing.T) {
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"bad key"}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ask", "--base-url", base, "--api-key", "k", "--model", "m", "--stream", "ping"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "401") {
+		t.Errorf("stderr = %q, want the 401 status", stderr.String())
+	}
+}
+
+// TestMessagesGuidelinesWithoutSystem covers the branch where --guidelines is set
+// but no --system text is given: the guidelines become the sole system message.
+func TestMessagesGuidelinesWithoutSystem(t *testing.T) {
+	msgs := messages("", []string{"lean-coding"}, "ping")
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %+v, want system+user", msgs)
+	}
+	if msgs[0].Role != "system" || !strings.Contains(msgs[0].Content, "engineering guidelines") {
+		t.Errorf("system message = %+v, want the guidelines", msgs[0])
+	}
+	if msgs[1].Role != "user" || msgs[1].Content != "ping" {
+		t.Errorf("user message = %+v, want {user ping}", msgs[1])
+	}
+}
+
+// TestConfigWriteBaseURL covers the branch that stores a base URL from flags.
+func TestConfigWriteBaseURL(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"config", "--base-url", "http://example.invalid/v1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "http://example.invalid/v1") {
+		t.Errorf("stdout missing the stored base URL:\n%s", stdout.String())
+	}
+}
+
+// TestConfigSaveErrorExits covers the branch where the config cannot be written:
+// a read-only config home lets LoadConfig treat the missing file as empty but
+// makes SaveConfig fail, and the command reports it. Unix-only, matching the
+// permission tests in the cli package.
+func TestConfigSaveErrorExits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits are not modelled on Windows")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil { // no write permission
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"config", "--model", "m"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "create config directory") {
+		t.Errorf("stderr = %q, want a config-directory error", stderr.String())
+	}
+}
+
+// TestConnectionFailsWhenConfigUnresolvable covers the branch where connection
+// cannot load the config: with neither XDG_CONFIG_HOME nor HOME set, the config
+// location cannot be resolved and the command fails.
+func TestConnectionFailsWhenConfigUnresolvable(t *testing.T) {
+	isolateCache(t)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+	t.Setenv("NVIDIA_API_KEY", "k") // a key is present; the config load still fails
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"models"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "resolve home directory") {
+		t.Errorf("stderr = %q, want a home-directory error", stderr.String())
+	}
+}
+
+// TestResolveModelFailsWhenConfigUnresolvable covers resolveModel's error
+// branch: with no --model and an unresolvable config, ask fails before it
+// connects.
+func TestResolveModelFailsWhenConfigUnresolvable(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "hello"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "resolve home directory") {
+		t.Errorf("stderr = %q, want a home-directory error", stderr.String())
+	}
+}
+
+// TestConfigFailsWhenConfigUnresolvable covers runConfig's config-load error
+// branch: with an unresolvable config location the command fails.
+func TestConfigFailsWhenConfigUnresolvable(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"config"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "resolve home directory") {
+		t.Errorf("stderr = %q, want a home-directory error", stderr.String())
+	}
+}
+
+// TestConfigBaseURLUsedWhenNoFlag covers the branch where no --base-url flag is
+// given: the base URL stored in the config file is used for the request.
+func TestConfigBaseURLUsedWhenNoFlag(t *testing.T) {
+	isolateCache(t)
+	var hit bool
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.Write([]byte(`{"data":[{"id":"nvidia/nemotron","owned_by":"nvidia"}]}`))
+	})
+
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	cfgPath := filepath.Join(dir, "nv", "config.json")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{"base_url":"`+base+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// No --base-url: the configured one must be picked up.
+	if code := run([]string{"models", "--api-key", "k"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !hit {
+		t.Error("request did not reach the base URL from the config file")
+	}
+	if !strings.Contains(stdout.String(), "nvidia/nemotron") {
+		t.Errorf("stdout missing model:\n%s", stdout.String())
+	}
 }
 
 // TestAskStreamOutlivesRequestTimeout proves the streaming path is not bound
@@ -475,5 +835,310 @@ func TestAskStreamOutlivesRequestTimeout(t *testing.T) {
 		if !strings.Contains(stdout.String(), fmt.Sprintf("chunk%d", i)) {
 			t.Errorf("stream was cut short: chunk%d missing from %q", i, stdout.String())
 		}
+	}
+}
+
+// --- model cache: refresh / offline / stale-fallback ---
+
+func TestModelsServesFreshCacheWithoutNetwork(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", dir)
+
+	// Seed a fresh cache directly so no server is needed.
+	seed := cli.ModelsCache{
+		FetchedAt: time.Now(),
+		Models:    []nim.Model{{ID: "cached/model", OwnedBy: "cached"}},
+	}
+	if err := cli.SaveModelsCache(seed); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// No --api-key: a network attempt would fail, so success proves the cache
+	// was served without touching the API.
+	code := run([]string{"models"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cached/model") {
+		t.Errorf("stdout missing cached model:\n%s", stdout.String())
+	}
+}
+
+func TestModelsRefreshForcesNetworkAndUpdatesCache(t *testing.T) {
+	isolateCache(t)
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"fresh/model","owned_by":"nvidia"}]}`))
+	})
+
+	// Seed a fresh cache first; --refresh must ignore it and hit the server.
+	if err := cli.SaveModelsCache(cli.ModelsCache{
+		FetchedAt: time.Now(),
+		Models:    []nim.Model{{ID: "stale/model"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"models", "--refresh", "--base-url", base, "--api-key", "k"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "fresh/model") {
+		t.Errorf("stdout missing refreshed model:\n%s", stdout.String())
+	}
+	// The cache must now hold the fresh list.
+	got, ok, err := cli.LoadModelsCache()
+	if err != nil || !ok {
+		t.Fatalf("cache reload: ok=%v err=%v", ok, err)
+	}
+	if len(got.Models) != 1 || got.Models[0].ID != "fresh/model" {
+		t.Errorf("cache not updated: %+v", got.Models)
+	}
+}
+
+func TestModelsOfflineUsesCacheWithoutNetwork(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", dir)
+	if err := cli.SaveModelsCache(cli.ModelsCache{
+		FetchedAt: time.Now().Add(-2 * cli.ModelsCacheTTL), // stale
+		Models:    []nim.Model{{ID: "offline/model"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// No --api-key: offline must not attempt a connection.
+	code := run([]string{"models", "--offline"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "offline/model") {
+		t.Errorf("stdout missing cached model:\n%s", stdout.String())
+	}
+}
+
+func TestModelsOfflineWithoutCacheFails(t *testing.T) {
+	isolateCache(t)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"models", "--offline"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "no cached model list") {
+		t.Errorf("stderr = %q, want a no-cache error", stderr.String())
+	}
+}
+
+func TestModelsStaleCacheUsedWhenFetchFails(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", dir)
+	if err := cli.SaveModelsCache(cli.ModelsCache{
+		FetchedAt: time.Now().Add(-2 * cli.ModelsCacheTTL), // stale, so it will try the network
+		Models:    []nim.Model{{ID: "stale/model"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"boom"}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"models", "--base-url", base, "--api-key", "k"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 with a stale fallback", code)
+	}
+	if !strings.Contains(stdout.String(), "stale/model") {
+		t.Errorf("stdout missing stale fallback:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "using cached list") {
+		t.Errorf("stderr = %q, want a cached-list warning", stderr.String())
+	}
+}
+
+func TestModelsCorruptCacheIsTolerated(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", dir)
+	path := filepath.Join(dir, "nv", "models.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"live/model","owned_by":"nvidia"}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"models", "--base-url", base, "--api-key", "k"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "warning:") {
+		t.Errorf("stderr = %q, want a corrupt-cache warning", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "live/model") {
+		t.Errorf("stdout missing live model:\n%s", stdout.String())
+	}
+}
+
+// --- skills ---
+
+func TestSkillsCommandListsEmbeddedSkills(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"skills"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, name := range []string{"lean-coding", "concise", "turkish", "shell-safe"} {
+		if !strings.Contains(out, name) {
+			t.Errorf("skills output missing %q:\n%s", name, out)
+		}
+	}
+}
+
+func TestSkillsCommandJSON(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"skills", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("skills --json is not valid JSON: %v\n%s", err, stdout.String())
+	}
+	if len(got) == 0 {
+		t.Error("skills --json returned no skills")
+	}
+}
+
+func TestAskSkillAttachesSystemPrompt(t *testing.T) {
+	var gotBody string
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"ask", "--base-url", base, "--api-key", "k", "--model", "m",
+		"--skill", "turkish", "hello",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(gotBody, "Turkish") {
+		t.Errorf("request body missing the turkish skill text: %s", gotBody)
+	}
+}
+
+func TestAskUnknownSkillFails(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ask", "--model", "m", "--skill", "nope", "hi"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "unknown skill") {
+		t.Errorf("stderr = %q, want an unknown-skill error", stderr.String())
+	}
+}
+
+func TestAskGuidelinesIsLeanCodingSkill(t *testing.T) {
+	var gotBody string
+	base := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"ask", "--base-url", base, "--api-key", "k", "--model", "m",
+		"--guidelines", "hi",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(gotBody, "engineering guidelines") {
+		t.Errorf("--guidelines did not attach the lean-coding skill: %s", gotBody)
+	}
+}
+
+func TestModelsUsesCacheWhenConnectionFails(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", dir)
+	t.Setenv("NVIDIA_API_KEY", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // no key in config either
+	if err := cli.SaveModelsCache(cli.ModelsCache{
+		FetchedAt: time.Now().Add(-2 * cli.ModelsCacheTTL), // stale -> tries the network
+		Models:    []nim.Model{{ID: "cached/fallback"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// No --api-key anywhere: connection() fails, so the stale cache is served.
+	code := run([]string{"models"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 with a cache fallback", code)
+	}
+	if !strings.Contains(stdout.String(), "cached/fallback") {
+		t.Errorf("stdout missing cached fallback:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "using cached list") {
+		t.Errorf("stderr = %q, want a cached-list warning", stderr.String())
+	}
+}
+
+func TestModelsNoCacheAndConnectionFailsExits(t *testing.T) {
+	isolateCache(t)
+	t.Setenv("NVIDIA_API_KEY", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"models"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "NVIDIA_API_KEY") {
+		t.Errorf("stderr = %q, want the key error", stderr.String())
+	}
+}
+
+func TestSkillsFlagParseErrorExits(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"skills", "--bogus"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+}
+
+func TestReplUnknownSkillFails(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"repl", "--skill", "nope"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "unknown skill") {
+		t.Errorf("stderr = %q, want an unknown-skill error", stderr.String())
+	}
+}
+
+func TestReplModelResolveErrorExits(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"repl"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "resolve home directory") {
+		t.Errorf("stderr = %q, want a home-directory error", stderr.String())
+	}
+}
+
+func TestConfigReadPathErrorExits(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"config"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
 	}
 }
