@@ -9,8 +9,8 @@ import (
 	"os/signal"
 	"strings"
 
-	"github.com/ali-ulu/nvidia-cli/internal/guidelines"
 	"github.com/ali-ulu/nvidia-cli/internal/nim"
+	"github.com/ali-ulu/nvidia-cli/internal/skills"
 )
 
 // REPL commands.
@@ -39,8 +39,9 @@ type REPL struct {
 	Model string
 	// System, when set, is sent as the first message of every turn.
 	System string
-	// UseGuidelines prepends the embedded lean-coding guidelines to System.
-	UseGuidelines bool
+	// Skills are the names of embedded skills whose system text is prepended
+	// to System.
+	Skills []string
 }
 
 // NewREPL returns a session that talks through client and prints to out.
@@ -129,16 +130,18 @@ func (r *REPL) Run(ctx context.Context, in io.Reader) int {
 	return 0
 }
 
-// systemPrompt assembles the configured system message, if any.
+// systemPrompt assembles the configured system message, if any: the attached
+// skills' text first, then the user's own --system text.
 func (r *REPL) systemPrompt() string {
-	if r.UseGuidelines {
-		g := guidelines.Text()
-		if r.System != "" {
-			return g + "\n\n" + r.System
+	system := r.System
+	if combined := skills.Combine(r.Skills); combined != "" {
+		if system != "" {
+			system = combined + "\n\n" + system
+		} else {
+			system = combined
 		}
-		return g
 	}
-	return r.System
+	return system
 }
 
 // tokenEstimate gives a coarse token count for a message (~4 chars/token).

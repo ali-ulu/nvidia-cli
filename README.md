@@ -31,14 +31,23 @@ export NVIDIA_API_KEY="nvapi-..."
 ## Usage
 
 ```sh
-# List every model
+# List every model (served from a cache; refreshed on a TTL)
 nv models
+
+# Force a network refresh and update the cache
+nv models --refresh
 
 # Only models whose id contains "nemotron"
 nv models --filter nemotron
 
+# Use the cached list only; never call the API
+nv models --offline
+
 # Send a single prompt
 nv ask --model nvidia/nemotron-3-super-120b-a12b "Explain what NIM is in one sentence."
+
+# The model is optional: with no --model and no config it falls back to a built-in default
+nv ask "Explain what NIM is in one sentence."
 
 # Stream the reply token by token
 nv ask --model nvidia/nemotron-3-super-120b-a12b --stream "Tell me a haiku about GPUs."
@@ -56,9 +65,12 @@ nv ask "Explain what NIM is in one sentence."
 nv ask --model nvidia/nemotron-3-super-120b-a12b \
   --system "Answer in Turkish." "Merhaba"
 
-# Ask for code with the embedded lean-coding guidelines attached
+# Attach one or more embedded skills (repeatable)
 nv ask --model nvidia/nemotron-3-super-120b-a12b \
-  --guidelines "Write a retry helper in Go."
+  --skill lean-coding --skill concise "Write a retry helper in Go."
+
+# List the embedded skills (or --json for machine-readable output)
+nv skills
 
 # Read the guidelines themselves
 nv guidelines
@@ -71,12 +83,41 @@ nv guidelines
 | `--api-key KEY` | all | API key; priority: flag > `$NVIDIA_API_KEY` > config file |
 | `--base-url URL` | all | override the endpoint (default `https://integrate.api.nvidia.com/v1`) |
 | `--filter TEXT` | `models` | case-insensitive id filter |
-| `--model NAME` | `ask`, `repl` | model to use (falls back to the config file) |
+| `--refresh` | `models` | force a network fetch and update the model cache |
+| `--offline` | `models` | use the cached model list only; never call the API |
+| `--model NAME` | `ask`, `repl` | model to use (falls back to the config file, then the built-in default) |
 | `--stream` | `ask` | stream the reply via SSE as tokens arrive |
 | `--system TEXT` | `ask`, `repl` | optional system prompt |
-| `--guidelines` | `ask`, `repl` | prepend the embedded coding guidelines to the system prompt |
+| `--skill NAME` | `ask`, `repl` | attach an embedded skill's system prompt (repeatable) |
+| `--guidelines` | `ask`, `repl` | attach the embedded coding guidelines (alias of `--skill lean-coding`) |
+| `--json` | `skills` | emit the skill list as JSON |
 
 `nv` exits `0` on success and `1` on any error, printing the reason to stderr.
+
+### Model list cache
+
+`nv models` caches the API's list on disk so repeated calls do not hit the
+network. The cache lives at `~/.cache/nv/models.json` (`XDG_CACHE_HOME` is
+honored) and is refreshed when it is older than 24 hours. `--refresh` forces a
+fetch; `--offline` serves the cache without any network call. If a fetch fails
+while a cached list exists, the cached list is used with a warning on stderr
+rather than failing.
+
+### Skills
+
+A skill is a named, embedded system prompt that `nv ask` and `nv repl` can
+attach with `--skill NAME` (repeatable). `nv skills` lists them and
+`nv skills --json` prints them as JSON. The embedded skills are:
+
+| Skill | Effect |
+|---|---|
+| `lean-coding` | the embedded lean-coding guidelines (also `--guidelines`) |
+| `concise` | answer briefly, without preamble or filler |
+| `turkish` | always reply in Turkish |
+| `shell-safe` | prefer safe, non-destructive shell commands |
+
+An attached skill's text is prepended to the user's own `--system` text, so an
+explicit instruction always wins.
 
 ### Config file
 
@@ -118,7 +159,8 @@ in `internal/guidelines/CREDITS.md`.
 ```
 main.go                  command dispatch and flags
 internal/nim/            HTTP client for the NIM API (retry, SSE streaming)
-internal/cli/            config file, API key resolution, REPL, output formatting
+internal/cli/            config file, model cache, API key resolution, REPL, output
+internal/skills/         embedded named skills (system prompts)
 internal/guidelines/     embedded coding guidelines (go:embed)
 ```
 

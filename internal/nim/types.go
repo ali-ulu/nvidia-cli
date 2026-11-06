@@ -5,6 +5,10 @@ import (
 	"strings"
 )
 
+// DefaultModel is the model ask/repl fall back to when neither --model nor the
+// config file names one. It is a model the hosted NIM endpoint serves.
+const DefaultModel = "nvidia/nemotron-3-super-120b-a12b"
+
 // Message is a single turn in a conversation.
 type Message struct {
 	Role    string `json:"role"`

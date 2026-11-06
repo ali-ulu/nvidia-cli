@@ -136,7 +136,7 @@ func TestREPLSystemPromptAndGuidelines(t *testing.T) {
 	in := "hello\n:quit\n"
 	session := NewREPL(nim.New("k", srv.URL), &strings.Builder{}, "m")
 	session.System = "be brief"
-	session.UseGuidelines = true
+	session.Skills = []string{"lean-coding"}
 	if code := session.Run(context.Background(), strings.NewReader(in)); code != 0 {
 		t.Fatal("Run exit != 0")
 	}
@@ -403,8 +403,8 @@ func (errReader) Read([]byte) (int, error) { return 0, errors.New("stdin broke")
 // on but no custom system prompt is set: the guidelines text is used verbatim.
 func TestSystemPromptGuidelinesWithoutSystem(t *testing.T) {
 	session := NewREPL(nim.New("k", "http://127.0.0.1:0"), &strings.Builder{}, "m")
-	session.UseGuidelines = true
-	if got, want := session.systemPrompt(), guidelines.Text(); got != want {
+	session.Skills = []string{"lean-coding"}
+	if got, want := session.systemPrompt(), guidelines.SystemPrompt(); got != want {
 		t.Errorf("systemPrompt = %q..., want the raw guidelines text", got[:min(40, len(got))])
 	}
 }
